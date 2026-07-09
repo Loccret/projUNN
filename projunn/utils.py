@@ -297,16 +297,8 @@ def fast_batch_qr(A):
     return A
 
 def fast_batch_qr_modified(A):
-    # slightly slower but a bit more stable
-    def proj(M, v):
-        return M@(conjugate_transpose(M)@v)
-    def norm_squared(M):
-        return torch.sum(M*torch.conj(M),dim = -2,keepdims = True)
-    A[:,:,:1] = A[:,:,:1] / torch.sqrt(norm_squared(A[:,:,:1]))
-    for i in range(1,A.shape[-1]):
-        A[:,:,i:] = A[:,:,i:] - proj(A[:,:,i-1:i],A[:,:,i:])
-        A[:,:,i:] = A[:,:,i:] / torch.sqrt(norm_squared(A[:,:,i:]))
-    return A
+    q, _ = torch.linalg.qr(A, mode='reduced')
+    return q
 
 
 def one_to_two_fft_indices(i, kernel_size):
@@ -444,4 +436,3 @@ class OrthoRegularizer:
         else:
             temp = torch.tensordot(param_dict['projector'],param_dict['param'].grad, dims = ([-1], [0]))
         return torch.einsum('abc,ad->dbc',temp, torch.conj(param_dict['projector']))
-

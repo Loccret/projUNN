@@ -2,45 +2,85 @@ import torch
 import torch.nn as nn
 import numpy as np
 import argparse
-import sys
+from pathlib import Path
 from torchvision import datasets, transforms
 import projunn
-import torchmetrics
 
-parser = argparse.ArgumentParser(description="Exponential Layer MNIST Task")
-parser.add_argument("--batch_size", type=int, default=128)
-parser.add_argument("--hidden_size", type=int, default=170)
-parser.add_argument("--epochs", type=int, default=200)
-parser.add_argument("--lr", type=float, default=0.001)
-parser.add_argument("--permute", action="store_true")
-parser.add_argument(
-    "--optimizer", type=str, default="RMSProp", choices=["RMSProp", "SGD"]
-)
-parser.add_argument(
-    "--projector", type=str, default="projUNND", choices=["projUNND", "projUNNT"]
-)
-parser.add_argument("--rank", type=int, default=1)
 
-args = parser.parse_args()
+def default_data_root():
+    repo_data = Path(__file__).resolve().parents[1] / "data"
+    if repo_data.exists():
+        return repo_data
+    return Path("./mnist")
 
-# Fix seed across experiments
-# Same seed as that used in "Orthogonal Recurrent Neural Networks with Scaled Cayley Transform"
-# https://github.com/SpartinStuff/scoRNN/blob/master/scoRNN_copying.py#L79
-torch.backends.cudnn.deterministic = True
-torch.backends.cudnn.benchmark = False
-torch.manual_seed(5544)
-np.random.seed(5544)
-permute = np.random.RandomState(92916)
-permutation = torch.LongTensor(permute.permutation(784))
 
-# create projector and optionally the optimizer
-def projector(param, update):
-    a, b = projunn.utils.LSI_approximation(update, k=args.rank)
-    if args.projector == "projUNND":
-        update = projunn.utils.projUNN_D(param.data, a, b, project_on=False)
-    else:
-        update = projunn.utils.projUNN_T(param.data, a, b, project_on=False)
-    return update
+class AccuracyMeter:
+    def __init__(self, device=None):
+        self.device = device
+        self.reset()
+
+    def cuda(self):
+        self.device = "cuda"
+        return self
+
+    def reset(self):
+        self.correct = 0
+        self.total = 0
+
+    def update(self, prediction, labels):
+        predicted = prediction.argmax(dim=1)
+        self.correct += int((predicted == labels).sum().item())
+        self.total += int(labels.numel())
+
+    def __call__(self, prediction, labels):
+        self.update(prediction, labels)
+
+    def compute(self):
+        value = 0.0 if self.total == 0 else self.correct / self.total
+        return torch.tensor(value, device=self.device)
+
+
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description="Exponential Layer MNIST Task")
+    parser.add_argument("--dataset", type=str, default="MNIST", choices=["MNIST"])
+    parser.add_argument("--batch_size", type=int, default=128)
+    parser.add_argument("--hidden_size", type=int, default=170)
+    parser.add_argument("--epochs", type=int, default=200)
+    parser.add_argument("-lr", "--lr", type=float, default=0.001)
+    parser.add_argument("--permute", action="store_true")
+    parser.add_argument(
+        "--optimizer", type=str, default="RMSProp", choices=["RMSProp", "SGD"]
+    )
+    parser.add_argument(
+        "--projector", type=str, default="projUNND", choices=["projUNND", "projUNNT"]
+    )
+    parser.add_argument("--rank", type=int, default=1)
+    return parser.parse_args(argv)
+
+
+def configure_reproducibility():
+    # Same seed as "Orthogonal Recurrent Neural Networks with Scaled Cayley Transform".
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    torch.manual_seed(5544)
+    np.random.seed(5544)
+
+
+def make_permutation():
+    permute = np.random.RandomState(92916)
+    return torch.LongTensor(permute.permutation(784))
+
+
+def make_projector(args):
+    def projector(param, update):
+        a, b = projunn.utils.LSI_approximation(update, k=args.rank)
+        if args.projector == "projUNND":
+            update = projunn.utils.projUNN_D(param.data, a, b, project_on=False)
+        else:
+            update = projunn.utils.projUNN_T(param.data, a, b, project_on=False)
+        return update
+
+    return projector
 
 
 class proj_net(nn.Module):
@@ -59,19 +99,26 @@ class proj_net(nn.Module):
 
 
 
-def main():
+def main(argv=None):
+    args = parse_args(argv)
+    configure_reproducibility()
+    permutation = make_permutation()
+
     # Load data
     kwargs = {"num_workers": 1, "pin_memory": True}
+    data_root = default_data_root()
     train_loader = torch.utils.data.DataLoader(
         datasets.MNIST(
-            "./mnist", train=True, download=True, transform=transforms.ToTensor()
+            data_root, train=True, download=True, transform=transforms.ToTensor()
         ),
         batch_size=args.batch_size,
         shuffle=True,
         **kwargs
     )
     test_loader = torch.utils.data.DataLoader(
-        datasets.MNIST("./mnist", train=False, transform=transforms.ToTensor()),
+        datasets.MNIST(
+            data_root, train=False, download=True, transform=transforms.ToTensor()
+        ),
         batch_size=args.batch_size,
         shuffle=True,
         **kwargs
@@ -82,16 +129,17 @@ def main():
     # Model and optimizers
     model = proj_net(1, args.hidden_size, 10).cuda()
     model.train()
+    projector = make_projector(args)
     if args.optimizer == "RMSProp":
         optimizer = projunn.optimizers.RMSprop(
             model.parameters(), projector=projector, lr=args.lr
         )
         scheduler = torch.optim.lr_scheduler.StepLR(optimizer, 60*len(train_loader), 0.2)
 
-    accuracy = torchmetrics.Accuracy(compute_on_step=False).cuda()
+    accuracy = AccuracyMeter().cuda()
 
 
-    for epoch in range(100):
+    for epoch in range(args.epochs):
         accuracy.reset()
         for batch_idx, (batch_x, batch_y) in enumerate(train_loader):
             if args.permute:
